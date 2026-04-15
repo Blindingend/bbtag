@@ -67,7 +67,7 @@ async def _send_layer(
             await session.flush()
         return True
     except Exception as exc:
-        print(f"\n❌ {layer_name}发送失败: {exc}")
+        print(f"\n[ERR] {layer_name}发送失败: {exc}")
         return False
 
 

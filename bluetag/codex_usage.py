@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from PIL import Image, ImageDraw, ImageFont
 
-from bluetag.ble import BleDependencyError
+from bluetag.ble import BleDependencyError, BleRuntimeError
 from bluetag.image import layer_to_bytes, process_bicolor_image
 from bluetag.screens import get_screen_profile
 from bluetag.transfer import send_bicolor_image
@@ -82,6 +82,14 @@ class LocalUsageSummary:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class CodexSource:
+    codex_home: Path
+    auth_path: Path
+    config_path: Path
+    sessions_root: Path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="把 Codex usage 画成 2.13 寸电子价签样式并推送。",
@@ -121,6 +129,11 @@ def parse_args() -> argparse.Namespace:
         "--input-json",
         type=Path,
         help="直接读取本地 usage JSON，跳过网络请求",
+    )
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        help="覆盖 Codex 凭证目录，目录下应包含 auth.json / config.toml",
     )
     parser.add_argument(
         "--auth-path",
@@ -164,6 +177,86 @@ def codex_home_dir() -> Path:
     if env_value:
         return Path(env_value).expanduser()
     return Path.home() / ".codex"
+
+
+def is_wsl() -> bool:
+    return bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"))
+
+
+def iter_windows_codex_homes(users_root: Path | None = None) -> list[Path]:
+    root = (users_root or Path("/mnt/c/Users")).expanduser()
+    if not root.exists():
+        return []
+
+    ignored = {"all users", "default", "default user", "public"}
+    homes: list[Path] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.lower() in ignored:
+            continue
+        codex_home = child / ".codex"
+        if codex_home.exists():
+            homes.append(codex_home)
+    return homes
+
+
+def candidate_codex_homes(
+    *,
+    primary_home: Path | None = None,
+    include_windows: bool | None = None,
+    windows_users_root: Path | None = None,
+) -> list[Path]:
+    homes: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path):
+        normalized = path.expanduser()
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        homes.append(normalized)
+
+    add(primary_home or codex_home_dir())
+    use_windows = is_wsl() if include_windows is None else include_windows
+    if use_windows:
+        for home in iter_windows_codex_homes(users_root=windows_users_root):
+            add(home)
+    return homes
+
+
+def codex_source_from_home(codex_home: Path) -> CodexSource:
+    home = codex_home.expanduser()
+    return CodexSource(
+        codex_home=home,
+        auth_path=home / "auth.json",
+        config_path=home / "config.toml",
+        sessions_root=home / "sessions",
+    )
+
+
+def explicit_codex_source(
+    auth_override: Path | None,
+    config_override: Path | None,
+) -> CodexSource:
+    auth_path = auth_override.expanduser() if auth_override else None
+    config_path = config_override.expanduser() if config_override else None
+
+    if auth_path and not config_path:
+        config_path = auth_path.parent / "config.toml"
+    if config_path and not auth_path:
+        auth_path = config_path.parent / "auth.json"
+
+    if auth_path is None or config_path is None:
+        default_source = codex_source_from_home(codex_home_dir())
+        auth_path = auth_path or default_source.auth_path
+        config_path = config_path or default_source.config_path
+
+    codex_home = auth_path.parent
+    return CodexSource(
+        codex_home=codex_home,
+        auth_path=auth_path,
+        config_path=config_path,
+        sessions_root=codex_home / "sessions",
+    )
 
 
 def get_auth_path(override: Path | None) -> Path:
@@ -210,6 +303,44 @@ def load_credentials(auth_path: Path) -> CodexCredentials:
         account_id=account_id,
         auth_kind="chatgpt_oauth",
     )
+
+
+def resolve_credential_source(
+    *,
+    codex_home_override: Path | None = None,
+    auth_override: Path | None = None,
+    config_override: Path | None = None,
+    candidate_homes: list[Path] | None = None,
+) -> tuple[CodexSource, CodexCredentials]:
+    if codex_home_override is not None:
+        source = codex_source_from_home(codex_home_override)
+        return source, load_credentials(source.auth_path)
+
+    if auth_override or config_override:
+        source = explicit_codex_source(auth_override, config_override)
+        return source, load_credentials(source.auth_path)
+
+    errors: list[str] = []
+    loaded: list[tuple[CodexSource, CodexCredentials]] = []
+    for home in candidate_homes or candidate_codex_homes(primary_home=codex_home_override):
+        source = codex_source_from_home(home)
+        try:
+            credentials = load_credentials(source.auth_path)
+        except CodexUsageError as exc:
+            errors.append(str(exc))
+            continue
+        loaded.append((source, credentials))
+
+    if not loaded:
+        if errors:
+            raise CodexUsageError(errors[0])
+        raise CodexUsageError("No usable Codex credentials found.")
+
+    for source, credentials in loaded:
+        if credentials.auth_kind == "chatgpt_oauth":
+            return source, credentials
+
+    return loaded[0]
 
 
 def parse_chatgpt_base_url(config_text: str) -> str | None:
@@ -580,6 +711,29 @@ def load_local_usage_summary(
     )
 
 
+def resolve_local_usage_summary(
+    *,
+    target_day: date | None = None,
+    candidate_homes: list[Path] | None = None,
+) -> tuple[LocalUsageSummary, CodexSource]:
+    errors: list[str] = []
+    for home in candidate_homes or candidate_codex_homes():
+        source = codex_source_from_home(home)
+        try:
+            summary = load_local_usage_summary(
+                sessions_root=source.sessions_root,
+                target_day=target_day,
+            )
+        except CodexUsageError as exc:
+            errors.append(f"{source.sessions_root}: {exc}")
+            continue
+        return summary, source
+
+    if errors:
+        raise CodexUsageError(errors[0])
+    raise CodexUsageError("No local Codex session roots found.")
+
+
 def _format_compact_tokens(value: int) -> str:
     absolute = abs(value)
     if absolute >= 1_000_000:
@@ -822,7 +976,7 @@ async def _find_target(args, profile) -> dict | None:
 
 def _layer_progress(layer_name: str, sent: int, total: int):
     if sent == total:
-        print(f"\r✅ {layer_name}发送完成! ({total} 包)")
+        print(f"\r[OK] {layer_name}发送完成! ({total} 包)")
     elif sent == 1 or sent % 10 == 0:
         print(f"\r  {layer_name}发送中 {sent}/{total}...", end="", flush=True)
 
@@ -848,7 +1002,7 @@ async def push_image_to_small_screen(image: Image.Image, args) -> bool:
 
     target = await _find_target(args, profile)
     if not target:
-        print("❌ 未找到设备")
+        print("[ERR] 未找到设备")
         return False
 
     session = await connect_session(
@@ -857,7 +1011,7 @@ async def push_image_to_small_screen(image: Image.Image, args) -> bool:
         connect_retries=DEFAULT_CONNECT_RETRIES,
     )
     if not session:
-        print("❌ 连接设备失败")
+        print("[ERR] 连接设备失败")
         return False
 
     try:
@@ -875,13 +1029,15 @@ async def push_image_to_small_screen(image: Image.Image, args) -> bool:
             on_progress=_layer_progress,
         )
         if not ok:
-            print("❌ 发送失败")
+            print("[ERR] 发送失败")
         return ok
     finally:
         await session.close()
 
 
-def load_usage_payload(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
+def load_usage_payload(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], str, CodexSource | None]:
     if args.input_json:
         try:
             payload = json.loads(args.input_json.read_text(encoding="utf-8"))
@@ -889,32 +1045,38 @@ def load_usage_payload(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
             raise CodexUsageError(f"Failed to read input JSON: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise CodexUsageError(f"Invalid input JSON: {exc}") from exc
-        return payload, f"file:{args.input_json}"
+        return payload, f"file:{args.input_json}", None
 
-    auth_path = get_auth_path(args.auth_path)
-    config_path = get_config_path(args.config_path)
-    credentials = load_credentials(auth_path)
+    source, credentials = resolve_credential_source(
+        codex_home_override=args.codex_home,
+        auth_override=args.auth_path,
+        config_override=args.config_path,
+    )
     if credentials.auth_kind == "api_key":
-        raise CodexUsageError("API-key auth does not support chatgpt.com usage endpoint.")
-    base_url = resolve_base_url(config_path, args.base_url)
+        raise CodexUsageError(
+            f"API-key auth does not support chatgpt.com usage endpoint "
+            f"({source.auth_path})."
+        )
+    base_url = resolve_base_url(source.config_path, args.base_url)
     payload = fetch_usage_json(base_url, credentials, args.timeout)
-    return payload, f"{base_url}{USAGE_PATH}"
+    return payload, f"{base_url}{USAGE_PATH} [{source.auth_path}]", source
 
 
 def main() -> int:
     args = parse_args()
     profile = get_screen_profile(args.screen)
     if profile.name != "2.13inch":
-        print("❌ 当前脚本只为 2.13 寸布局设计，请使用 --screen 2.13inch", file=sys.stderr)
+        print("[ERR] 当前脚本只为 2.13 寸布局设计，请使用 --screen 2.13inch", file=sys.stderr)
         return 2
 
     try:
         tzinfo = resolve_timezone(args.timezone)
         local_summary: LocalUsageSummary | None = None
+        usage_source: CodexSource | None = None
         rows: list[UsageRow] = []
 
         try:
-            payload, source = load_usage_payload(args)
+            payload, source, usage_source = load_usage_payload(args)
             rows = build_rows(payload, tzinfo)
             image = render_usage_image(
                 rows,
@@ -925,14 +1087,26 @@ def main() -> int:
         except CodexUsageError as exc:
             if args.input_json:
                 raise
-            local_summary = load_local_usage_summary()
+            candidate_homes: list[Path] = []
+            seen: set[Path] = set()
+            primary_home = args.codex_home or (usage_source.codex_home if usage_source else None)
+            for home in candidate_codex_homes(primary_home=primary_home):
+                normalized = home.expanduser()
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                candidate_homes.append(normalized)
+
+            local_summary, local_source = resolve_local_usage_summary(
+                candidate_homes=candidate_homes
+            )
             image = render_local_usage_image(
                 local_summary,
                 width=profile.width,
                 height=profile.height,
                 font_path=args.font,
             )
-            source = f"local-session-usage ({exc})"
+            source = f"local-session-usage [{local_source.sessions_root}] ({exc})"
 
         output_path = save_preview(image, Path(args.output))
         print(f"预览已保存: {output_path}")
@@ -960,8 +1134,8 @@ def main() -> int:
 
         try:
             ok = asyncio.run(push_image_to_small_screen(image, args))
-        except BleDependencyError as exc:
-            print(f"❌ {exc}", file=sys.stderr)
+        except (BleDependencyError, BleRuntimeError) as exc:
+            print(f"[ERR] {exc}", file=sys.stderr)
             return 2
         return 0 if ok else 1
     except CodexUsageError as exc:

@@ -218,3 +218,10 @@ marimo/_lsp/
 __marimo__/
 *.png
 .device
+
+# Local runtime/state (do not commit)
+codex_oauth_info/
+.venv-win/
+.pydeps/
+.pixi-bin/
+.codex
