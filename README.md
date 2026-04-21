@@ -38,6 +38,44 @@ LZO_DIR="$(brew --prefix lzo)" .venv/bin/pip install -e .
 
 需要蓝牙适配器 (USB dongle 或内置蓝牙)。
 
+### WSL 说明
+
+- `bluetag-codex-usage` 在 WSL 下会先查当前 Linux 侧的 `CODEX_HOME` / `~/.codex`，如果检测到 WSL，也会顺带搜索 `/mnt/c/Users/*/.codex`。
+- 如果找到 ChatGPT OAuth 登录态，会请求 `https://chatgpt.com/backend-api/wham/usage` 显示真正的 quota。
+- 如果当前只有 API key 登录态，ChatGPT usage 接口不可用，脚本会自动退回到本地 `sessions` 汇总并生成 `codex local` 预览。
+- 蓝牙发送仍依赖 Python `bleak` 和当前 Linux 环境可用的 BLE 栈。也就是说，WSL 里能否真正推送，取决于你的 WSL 是否已经具备可工作的 Linux 蓝牙访问；仓库当前没有内置 Windows BLE 桥接。
+
+### WSL 蓝牙桥接
+
+如果你在 Windows 上使用 USB 蓝牙适配器，可以用 `usbipd-win` 把这块 USB 设备交给 WSL，再在 Ubuntu 里用 `bluetoothctl` 控制。
+
+仓库里提供了一个 helper:
+
+```bash
+# 看当前 usbipd / WSL 蓝牙状态
+scripts/wsl-bluetooth status
+
+# 自动找到 "Bluetooth Radio" 并 attach 到当前 WSL distro
+scripts/wsl-bluetooth attach
+
+# attach 后直接扫描附近设备
+scripts/wsl-bluetooth scan
+
+# 用完后把 USB 蓝牙适配器还给 Windows
+scripts/wsl-bluetooth detach
+```
+
+这个脚本会调用：
+
+- Windows 侧的 `usbipd-win`
+- `wsl.exe -u root`
+- Ubuntu 里的 `systemctl` / `bluetoothctl`
+
+注意：
+
+- 设备 attach 到 WSL 期间，Windows 不能同时使用这块蓝牙适配器。
+- 某些 CSR 兼容适配器，尤其是 `VID:PID 0a12:0001`，即使 attach 成功，也可能在 Linux 里卡在 `CSR: Local version failed (-110)`，这属于适配器/驱动兼容性问题，不是脚本逻辑问题。
+
 ## CLI
 
 ```bash
@@ -67,6 +105,9 @@ uv run bluetag-codex-usage --preview-only
 
 # 指定目标 2.13 寸设备
 uv run bluetag-codex-usage --device EDP-F3F4F5F6
+
+# WSL 下先验证 quota / session 预览，不推送
+uv run bluetag-codex-usage --preview-only
 
 # 兼容旧入口
 uv run examples/push_codex_usage.py --preview-only
@@ -176,3 +217,8 @@ bbtag/
 │   └── push_macos_app_usage_3.7.py # macOS app usage -> 3.7 寸
 └── pyproject.toml
 ```
+
+## 运维索引
+
+- Windows 定时推送与手工触发说明：`docs/windows-codex-usage-scheduler.md`
+- 当前默认计划任务：`bbtag-codex-usage-30min`（已配置为每 10 分钟执行一次）
