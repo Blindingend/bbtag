@@ -563,6 +563,10 @@ def format_reset_text(resets_at: Any, tzinfo) -> str:
     return f"resets {time_text} on {reset_dt:%Y-%m-%d}"
 
 
+def format_update_time(update_time: datetime, tzinfo) -> str:
+    return f"update {update_time.astimezone(tzinfo):%m-%d %H:%M}"
+
+
 def build_rows(payload: dict[str, Any], tzinfo) -> list[UsageRow]:
     primary, secondary = extract_rate_limits(payload)
 
@@ -804,6 +808,7 @@ def render_usage_image(
     *,
     width: int = 250,
     height: int = 122,
+    update_time_text: str | None = None,
     font_path: str | None = None,
 ) -> Image.Image:
     img, draw = _new_crisp_canvas(width, height)
@@ -865,12 +870,27 @@ def render_usage_image(
 
         detail_bbox = draw.textbbox((0, 0), row.resets_text, font=detail_font)
         detail_w = detail_bbox[2] - detail_bbox[0]
+        detail_y = bar_y + bar_h + 4
         draw.text(
-            (width - right_pad - detail_w, bar_y + bar_h + 4),
+            (width - right_pad - detail_w, detail_y),
             row.resets_text,
             fill=0,
             font=detail_font,
         )
+
+        if update_time_text and idx == row_count - 1:
+            # Keep update time on the same row as the final resets label.
+            update_font = load_font(10, font_path=font_path)
+            update_bbox = draw.textbbox((0, 0), update_time_text, font=update_font)
+            update_w = update_bbox[2] - update_bbox[0]
+            max_line_w = width - left_pad - right_pad
+            if update_w + detail_w > max_line_w:
+                update_font = load_font(9, font_path=font_path)
+                update_bbox = draw.textbbox((0, 0), update_time_text, font=update_font)
+                update_w = update_bbox[2] - update_bbox[0]
+            if update_w + detail_w > max_line_w:
+                update_font = load_font(8, font_path=font_path)
+            draw.text((left_pad, detail_y), update_time_text, fill=0, font=update_font)
 
     return img.convert("RGB")
 
@@ -1082,6 +1102,7 @@ def main() -> int:
                 rows,
                 width=profile.width,
                 height=profile.height,
+                update_time_text=format_update_time(datetime.now(tzinfo), tzinfo),
                 font_path=args.font,
             )
         except CodexUsageError as exc:
